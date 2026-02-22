@@ -1,0 +1,14 @@
+auto lo
+iface lo inet loopback
+
+iface {{ pve_interface }} inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+        address {{ pve_bridge_ip }}
+        gateway {{ pve_gateway }}
+        bridge-ports {{ pve_interface }}
+        bridge-stp off
+        bridge-fd 0
+        bridge-vlan-aware yes
+        bridge-vids 2-4094

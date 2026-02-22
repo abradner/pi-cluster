@@ -1,0 +1,179 @@
+---
+- name: Raspberry Pi Proxmox ARM Cluster Setup
+  hosts: pve_nodes
+  become: yes
+  environment:
+    LC_ALL: "C.UTF-8"
+    LANG: "C.UTF-8"
+
+  vars:
+    # Networking is dynamically derived from the Pi's active DHCP connection
+    # These vars are used in the hosts/interfaces jinja templates
+    pve_interface: "end0" # Predictable interface name of onboard eth on Pi 5
+    pve_bridge_ip: "{{ ansible_facts.default_ipv4.address }}/24"
+    pve_gateway: "{{ ansible_facts.default_ipv4.gateway }}"
+
+    # Configuration mapped to inventory vars
+    user_name: "{{ hostvars[inventory_hostname].user_name }}"
+    locale: "{{ hostvars[inventory_hostname].locale }}"
+
+  tasks:
+    - name: Workaround Raspberry Pi OS first-boot initramfs corruption
+      shell: |
+        if [ -f /etc/initramfs-tools/update-initramfs.conf ] && ! grep -q 'update_initramfs=' /etc/initramfs-tools/update-initramfs.conf; then
+          rm -f /etc/initramfs-tools/update-initramfs.conf
+          dpkg --configure -a || true
+          apt-get update && apt-get install -y --reinstall initramfs-tools e2fsprogs
+        fi
+      changed_when: false
+
+    - name: Ensure system is up to date
+      apt:
+        upgrade: dist
+        update_cache: yes
+
+    - name: Ensure required locales exist
+      locale_gen:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - "{{ locale }}"
+        - "en_US.UTF-8"
+
+    - name: Suppress cloud-init locale warning
+      file:
+        path: /var/lib/cloud/instance/locale-check.skip
+        state: touch
+      failed_when: false # Ignore if using an OS without cloud-init
+
+    - name: Ensure Quality of Life packages are installed
+      apt:
+        name: [zsh, byobu]
+        state: present
+
+    - name: Set Shell and Byobu for user
+      user:
+        name: "{{ user_name }}"
+        shell: /bin/zsh
+    
+    - name: Enable Byobu for user
+      command: "sudo -u {{ user_name }} byobu-enable"
+      args:
+        creates: "/home/{{ user_name }}/.byobu/.enabled"
+
+    - name: Install Tailscale via official script
+      shell: |
+        curl -fsSL https://tailscale.com/install.sh | sh
+        tailscale up --auth-key={{ tailscale_auth_key }}
+      args:
+        creates: /usr/bin/tailscale
+      when: tailscale_auth_key is defined and tailscale_auth_key != ''
+
+    - name: Configure rpi-connect-lite
+      command: rpi-connect on
+      become: false
+      changed_when: false # It's usually on by default, just ensuring state
+
+    - name: Install Networking and PVE Dependencies
+      apt:
+        name: [ifupdown2, dkms, curl, gnupg2]
+        state: present
+
+    - name: Ensure Predictable Network Interface Names
+      command: raspi-config nonint do_net_names 0
+      changed_when: false
+      notify: "Reboot System"
+
+    - name: Update /etc/hosts for Proxmox
+      template:
+        src: templates/hosts.j2
+        dest: /etc/hosts
+
+    - name: Ensure cloud-init templates the correct hosts file
+      template:
+        src: templates/hosts.j2
+        dest: /etc/cloud/templates/hosts.debian.tmpl
+      notify: "Reboot System"
+
+    - name: Setup Bridge Interface (vmbr0)
+      template:
+        src: templates/interfaces.j2
+        dest: /etc/network/interfaces
+      notify: "Reboot System"
+
+    - name: Disable NetworkManager
+      systemd:
+        name: NetworkManager
+        enabled: no
+        state: stopped
+
+    - name: Add PXCloud/PXVirt Repository and Key
+      block:
+        - name: Download PXCloud GPG Key
+          get_url:
+            url: https://mirrors.lierfang.com/pxcloud/lierfang.gpg
+            dest: /etc/apt/trusted.gpg.d/lierfang.gpg
+
+        - name: Add PXVirt APT Repo
+          apt_repository:
+            repo: "deb https://mirrors.lierfang.com/pxcloud/pxvirt {{ ansible_facts.distribution_release }} main"
+            filename: pxvirt-sources
+
+    - name: Setup Debian Backports for ZFS
+      apt_repository:
+        repo: "deb http://deb.debian.org/debian {{ ansible_facts.distribution_release }}-backports main contrib non-free-firmware"
+        filename: backports
+
+    - name: Set ZFS Pinning Priority
+      copy:
+        content: |
+          Package: src:zfs-linux
+          Pin: release n={{ ansible_facts.distribution_release }}-backports
+          Pin-Priority: 990
+        dest: /etc/apt/preferences.d/90_zfs
+
+    - name: Update APT Cache for Architecture Additions
+      apt:
+        update_cache: yes
+
+    - name: Install ZFS Utilities (10ish minutes on pi5)
+      apt:
+        name: zfsutils-linux
+        state: present
+
+    - name: Compile ZFS Kernel Modules (probably short)
+      apt:
+        name: zfs-dkms
+        state: present
+
+    - name: Install Proxmox VE Core (8ish minutes on pi5)
+      apt:
+        name:
+          - proxmox-ve
+          - pve-manager
+          - qemu-server
+          - pve-cluster
+        state: present
+      notify: "Reboot System"
+
+    - name: Force Reboot for Proxmox Services Initialization
+      meta: flush_handlers
+
+    - name: Register user in Proxmox
+      command: "pveum user add {{ user_name }}@pam"
+      register: pveum_add_result
+      changed_when: "'already exists' not in pveum_add_result.stdout"
+      failed_when: "pveum_add_result.rc != 0 and 'already exists' not in pveum_add_result.stderr"
+      ignore_errors: yes # Might fail on first run before reboot/full service start
+
+    - name: Grant user Administrator rights in Proxmox
+      command: "pveum acl modify / -user {{ user_name }}@pam -role Administrator"
+      register: pveum_result
+      changed_when: "'already exists' not in pveum_result.stdout"
+      failed_when: "pveum_result.rc != 0 and 'already exists' not in pveum_result.stderr"
+      ignore_errors: yes # Might fail on first run before reboot/full service start
+
+  handlers:
+    - name: Reboot System
+      reboot:
+        msg: "Rebooting for Network/Proxmox changes"
