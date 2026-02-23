@@ -1,4 +1,41 @@
-# Raspberry Pi Proxmox Cluster Deployment Guide
+# Raspberry Pi Proxmox + Talos Kubernetes Cluster Setup
+
+## The Architecture: The "Why"
+
+This repository exists to automate the deployment of a highly specific, highly resilient edge computing architecture: **Running a virtualized Kubernetes Control Plane on Raspberry Pi 5 hardware via Proxmox VE (arm64).**
+
+While running Kubernetes natively on Raspberry Pis is common, this project makes several distinct, advanced architectural choices:
+
+### 1. Why Proxmox and Virtualized Control Planes?
+Typically, running a Talos Control Plane uses the entire physical node. In this lab, the actual Kubernetes *workloads* will run on a separate fleet of bare-metal Raspberry Pi Compute Modules (CM4/CM5). 
+These three Pi 5 nodes exist *exclusively* to host the Control Plane.
+
+By virtualizing the Control Planes inside Proxmox instead of flashing Talos directly to the metal:
+- **Resiliency & Backup:** A virtualized Control Plane can be cleanly snapshotted by Proxmox. If an `etcd` database corrupts or a K8s upgrade spectacularly fails, you can roll back the entire Control Plane VM in seconds. 
+- **Hardware Abstraction:** If a Pi hardware component fails, the Proxmox VM disk image can be seamlessly migrated or restored onto any other Pi in the cluster. It sits "above the hardware" as a drop-in replacement.
+- **Resource Segmentation:** An 8GB Pi has plenty of overhead. Virtualization allows us to cleanly allocate 4GB to the Kubernetes API, leaving the remaining memory for robust ZFS caching on the host without risking out-of-memory kernel panics killing the K8s API server.
+
+### 2. Why ZFS Mirroring?
+Raspberry Pis are notorious for micro-SD card failures under heavy I/O workloads (like Kubernetes databases). 
+- **The Choice:** We completely bypass the SD card for data storage. The playbook enforces the creation of a `data` ZFS pool mirrored across two physical NVMe SSDs hat-mounted on the Pi.
+- **The Benefit:** ZFS provides real-time data scrubbing, bit-rot protection, and automatic failover if an NVMe drive dies. The VMs boot and run entirely off this redundant block storage.
+
+### 3. Networking: The Backplane
+A Proxmox cluster (Corosync) expects high availability. If the primary network switch reboots, Corosync will panic and start fencing (rebooting) nodes.
+To prevent this, the playbook automatically discovers optional secondary USB Network Adapters and binds them into a dedicated, isolated Backplane subnet (`10.10.99.x`). The cluster heartbeat travels over this direct cable, isolating it from home network chaos.
+
+### 4. TLS Certificates (The acme.sh Workaround)
+Proxmox has a native ACME client, but Debian Trixie's updated security patches currently break the `pvenode` local REST deployment logic for some cryptographic operations. 
+We avoided the native client and instead implemented `acme.sh` pushing directly via `DNS-01` to Cloudflare. This completely bypasses the broken system dependencies and ensures the Proxmox GUI is always served via valid, trusted TLS without opening any firewall ports (HTTP-01).
+
+### The Shortcomings (What you need to know)
+- **ARM64 Translation:** Proxmox officially supports `x86_64`. The `arm64` port relies on specific kernel forks (PXVirt repository). While incredibly stable, it requires careful manipulation of hardware abstractions (we use `aarch64` and `OVMF` in the Talos VMs) to boot successfully. 
+- **SD Card Fragility:** The base OS still boots from an SD card. While all high-I/O data was moved to the NVMe ZFS array to mitigate wear, the SD card remains a single point of failure for the host bootloader.
+- **Talos Kubelet Runtimes:** The Talos Image Factory doesn't provide natively compiled GPU or NPU drivers (like Hailo-8) for ARM64 by default. If you intend to do edge AI, you will need to passthrough those PCIe devices directly to bare-metal workers rather than virtualized Control Planes.
+
+---
+
+## 1. Proxmox Bare-Metal Automation
 
 This guide covers how to deploy the Proxmox environment to a fresh Raspberry Pi node using the provided Ansible playbook.
 
