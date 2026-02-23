@@ -14,8 +14,23 @@
     pve_gateway: "{{ ansible_facts.default_ipv4.gateway }}"
 
     # Configuration mapped to inventory vars
+    pve_backplane_cidr: "{{ hostvars[inventory_hostname].pve_backplane_cidr | default('') }}"
+    
+    # Derives the IP suffix (e.g., '50' from '10.10.80.50') and maps it onto the chosen Backplane CIDR (e.g., '10.10.99.0/24' -> '10.10.99.50')
+    pve_backplane_ip: >-
+      {{ 
+         (pve_backplane_cidr != '') | ternary(
+           ((pve_backplane_cidr | split('/'))[0] | split('.'))[:-1] | join('.') ~ '.' ~ (ansible_host | split('.') | last) ~ '/' ~ (pve_backplane_cidr | split('/'))[1],
+           ''
+         ) 
+      }}
+
+    # Configuration mapped to inventory vars
     user_name: "{{ hostvars[inventory_hostname].user_name }}"
     locale: "{{ hostvars[inventory_hostname].locale }}"
+    cluster_name: "{{ hostvars[inventory_hostname].cluster_name | default('k8sctl') }}"
+    zfs_pool_name: "data"
+    zfs_nvme_drives: "/dev/nvme0n1 /dev/nvme1n1"
 
   tasks:
     - name: Workaround Raspberry Pi OS first-boot initramfs corruption
@@ -26,6 +41,24 @@
           apt-get update && apt-get install -y --reinstall initramfs-tools e2fsprogs
         fi
       changed_when: false
+
+    - name: Ensure Predictable Network Interface Names
+      command: raspi-config nonint do_net_names 0
+      changed_when: false
+      notify: "Reboot System"
+
+    - name: Flush handlers to ensure predictable names apply immediately
+      meta: flush_handlers
+
+    - name: Refresh facts to capture predictable network interface names
+      setup:
+        gather_subset:
+          - network
+
+    - name: Discover Dedicated Cluster Backplane Interface
+      set_fact:
+        pve_backplane_interface: "{{ (ansible_interfaces | reject('search', '^(lo|end0|eth0|eth1|wlan.*|vmbr.*|tailscale.*|veth.*|fwbr.*|fwpr.*|fwln.*|tap.*)$') | list) | first | default('') }}"
+      when: pve_backplane_cidr != ''
 
     - name: Ensure system is up to date
       apt:
@@ -48,8 +81,56 @@
 
     - name: Ensure Quality of Life packages are installed
       apt:
-        name: [zsh, byobu]
+        name: [zsh, byobu, git, lsd, fzf]
         state: present
+
+    - name: Copy recommended zshrc
+      copy:
+        remote_src: yes
+        src: /etc/zsh/newuser.zshrc.recommended
+        dest: "/home/{{ user_name }}/.zshrc"
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        force: no
+
+    - name: Install Oh My Zsh
+      become: false
+      shell: 'curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh | sh -s -- --unattended'
+      args:
+        creates: "/home/{{ user_name }}/.oh-my-zsh"
+
+    - name: Clone ZSH plugins
+      become: false
+      git:
+        repo: "{{ item.repo }}"
+        dest: "/home/{{ user_name }}/.oh-my-zsh/custom/plugins/{{ item.name }}"
+      loop:
+        - { repo: 'https://github.com/zsh-users/zsh-autosuggestions', name: 'zsh-autosuggestions' }
+        - { repo: 'https://github.com/zsh-users/zsh-syntax-highlighting.git', name: 'zsh-syntax-highlighting' }
+
+    - name: Configure Oh My Zsh plugins
+      become: false
+      lineinfile:
+        path: "/home/{{ user_name }}/.zshrc"
+        regexp: '^plugins='
+        line: 'plugins=(git zsh-autosuggestions zsh-syntax-highlighting)'
+
+    - name: Configure lsd and fzf integration
+      become: false
+      blockinfile:
+        path: "/home/{{ user_name }}/.zshrc"
+        marker: "# {mark} TERMINAL QOL INTEGRATION #"
+        block: |
+          # lsd aliases
+          alias ls='lsd'
+          alias l='ls -l'
+          alias la='ls -a'
+          alias lla='ls -la'
+          alias lt='ls --tree'
+
+          # fzf integration
+          source /usr/share/doc/fzf/examples/key-bindings.zsh
+          source /usr/share/doc/fzf/examples/completion.zsh
 
     - name: Set Shell and Byobu for user
       user:
@@ -76,13 +157,8 @@
 
     - name: Install Networking and PVE Dependencies
       apt:
-        name: [ifupdown2, dkms, curl, gnupg2]
+        name: [ifupdown2, dkms, curl, gnupg2, python3-pexpect]
         state: present
-
-    - name: Ensure Predictable Network Interface Names
-      command: raspi-config nonint do_net_names 0
-      changed_when: false
-      notify: "Reboot System"
 
     - name: Update /etc/hosts for Proxmox
       template:
@@ -156,6 +232,12 @@
         state: present
       notify: "Reboot System"
 
+    - name: Final System Upgrade (Post-Proxmox Repos)
+      apt:
+        upgrade: dist
+        update_cache: yes
+      notify: "Reboot System"
+
     - name: Force Reboot for Proxmox Services Initialization
       meta: flush_handlers
 
@@ -172,6 +254,131 @@
       changed_when: "'already exists' not in pveum_result.stdout"
       failed_when: "pveum_result.rc != 0 and 'already exists' not in pveum_result.stderr"
       ignore_errors: yes # Might fail on first run before reboot/full service start
+
+    # --- CLUSTER & STORAGE AUTOMATION ---
+
+    - name: Check Cluster Status
+      command: pvecm status
+      register: pvecm_status
+      failed_when: false
+      changed_when: false
+
+    - name: Initialize Proxmox Cluster (Creator Node)
+      command: >
+        pvecm create {{ cluster_name }}
+        {% if pve_backplane_ip != '' %}
+        --link0 {{ pve_backplane_ip | split('/') | first }}
+        --link1 {{ ansible_host }}
+        {% endif %}
+      when: 
+        - inventory_hostname == groups['pve_nodes'][0]
+        - pvecm_status.rc != 0
+
+    - name: Set temporary root password for Cluster Join
+      shell: "echo 'root:pvecm-temp-pass-2026' | chpasswd"
+      when: 
+        - inventory_hostname == groups['pve_nodes'][0]
+      changed_when: false
+
+    - name: Join Proxmox Cluster (Joiner Nodes)
+      expect:
+        command: >
+          pvecm add {{ hostvars[groups['pve_nodes'][0]]['ansible_host'] }}
+          {% if pve_backplane_ip != '' %}
+          --link0 {{ pve_backplane_ip | split('/') | first }}
+          --link1 {{ ansible_host }}
+          {% endif %}
+        responses:
+          "(?i)password": "pvecm-temp-pass-2026"
+          "(?i)continue connecting": "yes"
+        timeout: 60
+      when:
+        - inventory_hostname != groups['pve_nodes'][0]
+        - pvecm_status.rc != 0
+      register: cluster_join
+
+    - name: Lock root password globally
+      command: passwd -l root
+      changed_when: false
+
+    - name: Check if ZFS pool exists
+      command: "zpool status {{ zfs_pool_name }}"
+      register: zpool_status
+      failed_when: false
+      changed_when: false
+
+    - name: Try to import existing ZFS pool (Node Rebuild Scenario)
+      command: "zpool import -f {{ zfs_pool_name }}"
+      when: zpool_status.rc != 0
+      register: zpool_import
+      failed_when: false
+      changed_when: "zpool_import.rc == 0"
+
+    - name: Create ZFS Mirror Pool
+      command: "zpool create -f -o ashift=12 {{ zfs_pool_name }} mirror {{ zfs_nvme_drives }}"
+      when: zpool_status.rc != 0 and (zpool_import.rc is not defined or zpool_import.rc != 0)
+
+    - name: Create ZFS File Dataset
+      command: "zfs create {{ zfs_pool_name }}/pve-files"
+      register: zfs_ds_create
+      failed_when: "zfs_ds_create.rc != 0 and 'already exists' not in zfs_ds_create.stderr"
+      changed_when: "zfs_ds_create.rc == 0"
+
+    - name: Configure Proxmox ZFS Storage (Creator Node)
+      command: "pvesm add zfspool local-nvme -pool {{ zfs_pool_name }} -content images,rootdir -sparse 1"
+      when: inventory_hostname == groups['pve_nodes'][0]
+      register: pvesm_zfs
+      failed_when: "pvesm_zfs.rc != 0 and 'already defined' not in pvesm_zfs.stderr"
+      changed_when: "pvesm_zfs.rc == 0"
+
+    - name: Configure Proxmox Directory Storage (Creator Node)
+      command: "pvesm add dir local-files -path /{{ zfs_pool_name }}/pve-files -content iso,vztmpl,backup,snippets -shared 0"
+      when: inventory_hostname == groups['pve_nodes'][0]
+      register: pvesm_dir
+      failed_when: "pvesm_dir.rc != 0 and 'already defined' not in pvesm_dir.stderr"
+      changed_when: "pvesm_dir.rc == 0"
+
+    - name: Disable default local-lvm storage
+      command: "pvesm set local-lvm --disable 1"
+      when: inventory_hostname == groups['pve_nodes'][0]
+      register: pvesm_disable_lvm
+      failed_when: false
+      changed_when: false
+
+    - name: Disable default local storage
+      command: "pvesm set local --disable 1"
+      when: inventory_hostname == groups['pve_nodes'][0]
+      register: pvesm_disable_local
+      failed_when: false
+      changed_when: false
+
+    - name: Configure Automatic TLS via ACME.sh (Optional)
+      block:
+        - name: Download and Install acme.sh
+          shell: "curl https://get.acme.sh | sh -s email={{ acme_email }}"
+          args:
+            creates: /root/.acme.sh/acme.sh
+
+        - name: Clean up corrupted ACME state (if cert failed but folder exists)
+          shell: "rm -rf /root/.acme.sh/{{ inventory_hostname }}.{{ acme_domain_suffix }}_ecc"
+          args:
+            removes: "/root/.acme.sh/{{ inventory_hostname }}.{{ acme_domain_suffix }}_ecc/{{ inventory_hostname }}.{{ acme_domain_suffix }}.conf"
+            creates: "/root/.acme.sh/{{ inventory_hostname }}.{{ acme_domain_suffix }}_ecc/{{ inventory_hostname }}.{{ acme_domain_suffix }}.cer"
+
+        - name: Issue TLS Certificate via DNS-01 and Deploy to Proxmox GUI
+          shell: |
+            /root/.acme.sh/acme.sh --issue -d {{ inventory_hostname }}.{{ acme_domain_suffix }} --dns {{ acme_dns_provider }} --server letsencrypt
+            /root/.acme.sh/acme.sh --install-cert -d {{ inventory_hostname }}.{{ acme_domain_suffix }} \
+              --cert-file /etc/pve/local/pveproxy-ssl.pem \
+              --key-file /etc/pve/local/pveproxy-ssl.key \
+              --fullchain-file /etc/pve/local/pveproxy-ssl.pem \
+              --reloadcmd "systemctl restart pveproxy"
+          environment: "{{ acme_env | from_json if acme_env is defined else {} }}"
+          args:
+            # Only issue and deploy if the certificate folder doesn't already exist on this node
+            creates: "/root/.acme.sh/{{ inventory_hostname }}.{{ acme_domain_suffix }}_ecc/{{ inventory_hostname }}.{{ acme_domain_suffix }}.cer"
+
+      when: acme_email is defined and acme_domain_suffix is defined and acme_dns_provider is defined
 
   handlers:
     - name: Reboot System

@@ -36,8 +36,14 @@ This guide covers how to deploy the Proxmox environment to a fresh Raspberry Pi 
     [pve_nodes:vars]
     user_name=your_username
     locale=en_AU.UTF-8 # G'day
-    ```
 
+    # (Optional) ACME.sh TLS Automation
+    # acme_domain_suffix=k8s.myhomelab.com
+    # acme_email=your_email@example.com
+    # acme_dns_provider=dns_cf # Check acme.sh documentation for your DNS API provider code
+    # acme_env='{"CF_Token": "your_cloudflare_api_token"}' # Provide the required environment variables for your DNS API as a JSON dictionary
+    ```
+    If the optional `acme_` variables are fully populated, the playbook will automatically install `acme.sh`, use the DNS-01 challenge to issue an FQDN certificate natively for the node (`inventory_hostname.acme_domain_suffix`), and deploy it to the Proxmox GUI.
 
 ## Running the Playbook
 
@@ -61,7 +67,7 @@ The playbook will take about 25min all up, mostly during the ZFS and Proxmox ins
 
 ### Anatomy of the command
 
-Understand what the switches mean before running and adjust to your needs
+Make sure you understand what the switches mean and adjust to your needs:
 *   `-l k8sctl-pi5r`: Limits the execution to just the one node
     * prevents re-running against existing nodes
     * you **can omit this** if you're ready to roll out all your nodes at once.

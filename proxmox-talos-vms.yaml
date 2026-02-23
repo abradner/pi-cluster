@@ -1,0 +1,99 @@
+---
+- name: Automate Talos Kubernetes VMs on Proxmox
+  hosts: localhost
+  gather_facts: no
+  connection: local
+
+  vars:
+    # --- Proxmox API Authentication ---
+    # We extract the cluster's main API endpoint from the first node in the inventory.
+    proxmox_host: "{{ hostvars[groups['pve_nodes'][0]]['ansible_host'] }}"
+    proxmox_api_user: "root@pam" 
+    
+    # You can customize this lookup plugin to pull from 1Password, Ansible Vault, etc.
+    # Defaulting to an Environment Variable: export PROXMOX_PASSWORD="YOUR_PASSWORD"
+    proxmox_api_password: "{{ lookup('env', 'PROXMOX_PASSWORD') }}"
+    
+    # --- Talos Image Factory ---
+    talos_iso_url: "https://factory.talos.dev/image/88d1f7a5c4f1d3aba7df787c448c1d3d008ed29cfb34af53fa0df4336a56040b/v1.12.4/nocloud-arm64.iso"
+    talos_iso_filename: "talos-v1.12.4-arm64-custom.iso"
+    iso_storage_pool: "local-files"
+
+    # --- Virtual Machine Specifications ---
+    vm_storage_pool: "local-nvme"
+    vm_cores: 4
+    vm_memory: 4096
+    vm_disk_size: 32 # GB
+    vm_bridge: "vmbr0"
+
+  tasks:
+    - name: Ensure 'proxmoxer' and 'requests' Python libraries are installed locally
+      pip:
+        name: 
+          - proxmoxer
+          - requests
+        state: present
+      delegate_to: localhost
+      run_once: true
+
+    - name: Download Custom Talos ISO to Proxmox Datastore
+      community.general.proxmox_storage_contents:
+        api_host: "{{ proxmox_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_password: "{{ proxmox_api_password }}"
+        api_port: 8006
+        validate_certs: no
+        node: "{{ hostvars[groups['pve_nodes'][0]]['inventory_hostname'] }}"
+        storage: "{{ iso_storage_pool }}"
+        filename: "{{ talos_iso_filename }}"
+        url: "{{ talos_iso_url }}"
+        state: present
+      run_once: true
+
+    - name: Provision Talos Control Plane VMs
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_password: "{{ proxmox_api_password }}"
+        api_port: 8006
+        validate_certs: no
+        
+        node: "{{ item }}"
+        name: "talos-cp-{{ item }}"
+        # Extract the last octet of the node IP to generate a deterministic VMID (e.g., 10.10.80.50 -> VMID 150)
+        vmid: "1{{ hostvars[item]['ansible_host'].split('.') | last }}"
+        
+        # Hardware
+        ostype: l26
+        arch: aarch64
+        bios: ovmf
+        machine: q35
+        cores: "{{ vm_cores }}"
+        memory: "{{ vm_memory }}"
+        scsihw: virtio-scsi-pci
+        
+        # Disk Settings
+        efidisk0:
+          storage: "{{ vm_storage_pool }}"
+          efitype: 4m
+          format: raw
+          pre-enrolled-keys: 0
+        virtio0:
+          storage: "{{ vm_storage_pool }}"
+          size: "{{ vm_disk_size }}"
+          format: raw
+          discard: true
+          iothread: true
+          
+        # ISO Attachment
+        ide2: "{{ iso_storage_pool }}:iso/{{ talos_iso_filename }},media=cdrom"
+        boot: "order=ide2;virtio0"
+        
+        # Networking
+        net0: "virtio,bridge={{ vm_bridge }}"
+        
+        # Guest Agent
+        agent: 1
+
+        state: started
+      loop: "{{ groups['pve_nodes'] }}"
