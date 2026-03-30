@@ -1,8 +1,8 @@
 ---
 - name: Automate Talos Kubernetes VMs on Proxmox
-  hosts: localhost
-  gather_facts: no
-  connection: local
+  hosts: pve_nodes
+  gather_facts: false
+  serial: 1
 
   vars:
     # --- Proxmox API Authentication ---
@@ -10,13 +10,12 @@
     proxmox_host: "{{ hostvars[groups['pve_nodes'][0]]['ansible_host'] }}"
     proxmox_api_user: "root@pam" 
     
-    # You can customize this lookup plugin to pull from 1Password, Ansible Vault, etc.
-    # Defaulting to an Environment Variable: export PROXMOX_PASSWORD="YOUR_PASSWORD"
-    proxmox_api_password: "{{ lookup('env', 'PROXMOX_PASSWORD') }}"
+    use_temp_root_password: "{{ hostvars[inventory_hostname].use_temp_root_password | default('False') }}"
+    proxmox_host_root_password: "{{ hostvars[inventory_hostname].proxmox_host_root_password | default('pvecm-temp-pass-2026') }}"
     
     # --- Talos Image Factory ---
-    talos_iso_url: "https://factory.talos.dev/image/88d1f7a5c4f1d3aba7df787c448c1d3d008ed29cfb34af53fa0df4336a56040b/v1.12.4/nocloud-arm64.iso"
-    talos_iso_filename: "talos-v1.12.4-arm64-custom.iso"
+    talos_iso_url: "https://factory.talos.dev/image/88d1f7a5c4f1d3aba7df787c448c1d3d008ed29cfb34af53fa0df4336a56040b/v1.11.5/nocloud-arm64.iso"
+    talos_iso_filename: "talos-v1.11.5-arm64-custom.iso"
     iso_storage_pool: "local-files"
 
     # --- Virtual Machine Specifications ---
@@ -27,73 +26,89 @@
     vm_bridge: "vmbr0"
 
   tasks:
-    - name: Ensure 'proxmoxer' and 'requests' Python libraries are installed locally
-      pip:
-        name: 
-          - proxmoxer
-          - requests
-        state: present
-      delegate_to: localhost
-      run_once: true
+    - name: Download Custom Talos ISO directly to Proxmox ZFS (All Nodes)
+      shell: "wget -q -O /{{ zfs_pool_name | default('data') }}/pve-files/template/iso/{{ talos_iso_filename }} '{{ talos_iso_url }}'"
+      args:
+        creates: "/{{ zfs_pool_name | default('data') }}/pve-files/template/iso/{{ talos_iso_filename }}"
+      become: yes
 
-    - name: Download Custom Talos ISO to Proxmox Datastore
-      community.general.proxmox_storage_contents:
-        api_host: "{{ proxmox_host }}"
-        api_user: "{{ proxmox_api_user }}"
-        api_password: "{{ proxmox_api_password }}"
-        api_port: 8006
-        validate_certs: no
-        node: "{{ hostvars[groups['pve_nodes'][0]]['inventory_hostname'] }}"
-        storage: "{{ iso_storage_pool }}"
-        filename: "{{ talos_iso_filename }}"
-        url: "{{ talos_iso_url }}"
-        state: present
-      run_once: true
+    - name: Sequentially Provision and Start Cluster VMs
+      throttle: 1
+      block:
+        - name: Set temporary root password for VM creation
+          shell: "echo 'root:{{ proxmox_host_root_password }}' | chpasswd"
+          when: use_temp_root_password
+          changed_when: false
+          become: yes
 
-    - name: Provision Talos Control Plane VMs
-      community.general.proxmox_kvm:
-        api_host: "{{ proxmox_host }}"
-        api_user: "{{ proxmox_api_user }}"
-        api_password: "{{ proxmox_api_password }}"
-        api_port: 8006
-        validate_certs: no
-        
-        node: "{{ item }}"
-        name: "talos-cp-{{ item }}"
-        # Extract the last octet of the node IP to generate a deterministic VMID (e.g., 10.10.80.50 -> VMID 150)
-        vmid: "1{{ hostvars[item]['ansible_host'].split('.') | last }}"
-        
-        # Hardware
-        ostype: l26
-        arch: aarch64
-        bios: ovmf
-        machine: q35
-        cores: "{{ vm_cores }}"
-        memory: "{{ vm_memory }}"
-        scsihw: virtio-scsi-pci
-        
-        # Disk Settings
-        efidisk0:
-          storage: "{{ vm_storage_pool }}"
-          efitype: 4m
-          format: raw
-          pre-enrolled-keys: 0
-        virtio0:
-          storage: "{{ vm_storage_pool }}"
-          size: "{{ vm_disk_size }}"
-          format: raw
-          discard: true
-          iothread: true
+        - name: Provision Talos Control Plane VMs
+          community.general.proxmox_kvm:
+            api_host: "{{ ansible_host }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_host_root_password }}"
+            api_port: 8006
+            validate_certs: no
+            timeout: 120
+            
+            node: "{{ inventory_hostname }}"
+            name: "talos-cp-{{ inventory_hostname }}"
+            # Extract the last octet of the node IP to generate a deterministic VMID (e.g., 10.10.80.50 -> VMID 150)
+            vmid: "1{{ ansible_host.split('.') | last }}"
+            
+            # Hardware
+            ostype: l26
+            bios: ovmf
+            machine: virt
+            cpu: host
+            cores: "{{ vm_cores }}"
+            memory: "{{ vm_memory }}"
+            scsihw: virtio-scsi-pci
+            
+            # Disk Settings
+            efidisk0:
+              storage: "{{ vm_storage_pool }}"
+              efitype: 4m
+              format: raw
+              pre_enrolled_keys: false
+            
+            scsi:
+              scsi0: "{{ vm_storage_pool }}:{{ vm_disk_size }}"
+              scsi2: "{{ iso_storage_pool }}:iso/{{ talos_iso_filename }},media=cdrom"
+              
+            boot: "order=scsi0;scsi2;net0"
+            
+            # Networking
+            net:
+              net0: "virtio,bridge={{ vm_bridge }}"
+            
+            # Guest Agent
+            agent: 1
+    
+            state: present
+          delegate_to: localhost
           
-        # ISO Attachment
-        ide2: "{{ iso_storage_pool }}:iso/{{ talos_iso_filename }},media=cdrom"
-        boot: "order=ide2;virtio0"
-        
-        # Networking
-        net0: "virtio,bridge={{ vm_bridge }}"
-        
-        # Guest Agent
-        agent: 1
+        - name: Wait 15 seconds for Corosync to settle the ZFS allocations
+          ansible.builtin.wait_for:
+            timeout: 15
+          delegate_to: localhost
+            
+        - name: Start Talos Control Plane VMs
+          community.general.proxmox_kvm:
+            api_host: "{{ ansible_host }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_host_root_password }}"
+            api_port: 8006
+            validate_certs: no
+            timeout: 120
+            
+            node: "{{ inventory_hostname }}"
+            vmid: "1{{ ansible_host.split('.') | last }}"
+            state: started
+          delegate_to: localhost
 
-        state: started
-      loop: "{{ groups['pve_nodes'] }}"
+        - name: Lock root password globally
+          command: passwd -l root
+          when: use_temp_root_password
+          changed_when: false
+          become: yes
+

@@ -42,18 +42,29 @@
         fi
       changed_when: false
 
+    - name: Check if legacy network names are active
+      set_fact:
+        needs_net_reboot: "{{ 'eth0' in ansible_interfaces or 'eth1' in ansible_interfaces }}"
+
+    - name: Explicitly bind NetworkManager to primary MAC address to survive rename
+      command: nmcli connection add type ethernet con-name "Ansible-Fallback" ifname "*" mac "{{ ansible_default_ipv4.macaddress }}" autoconnect yes
+      when: needs_net_reboot
+      failed_when: false
+
     - name: Ensure Predictable Network Interface Names
       command: raspi-config nonint do_net_names 0
-      changed_when: false
-      notify: "Reboot System"
+      when: needs_net_reboot
 
-    - name: Flush handlers to ensure predictable names apply immediately
-      meta: flush_handlers
+    - name: Reboot to apply predictable network interface names
+      reboot:
+        msg: "Rebooting to apply predictable network interface names"
+      when: needs_net_reboot
 
     - name: Refresh facts to capture predictable network interface names
       setup:
         gather_subset:
           - network
+      when: needs_net_reboot
 
     - name: Discover Dedicated Cluster Backplane Interface
       set_fact:
@@ -283,7 +294,7 @@
     - name: Join Proxmox Cluster (Joiner Nodes)
       expect:
         command: >
-          pvecm add {{ hostvars[groups['pve_nodes'][0]]['ansible_host'] }}
+          pvecm add {{ groups['pve_nodes'][0] ~ '.' ~ acme_domain_suffix if (acme_domain_suffix is defined and acme_domain_suffix != '') else hostvars[groups['pve_nodes'][0]]['ansible_host'] }}
           {% if pve_backplane_ip != '' %}
           --link0 {{ pve_backplane_ip | split('/') | first }}
           --link1 {{ ansible_host }}
